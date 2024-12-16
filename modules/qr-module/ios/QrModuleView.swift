@@ -3,72 +3,147 @@ import UIKit
 import AVFoundation
 
 class QrModuleView: UIView, AVCaptureMetadataOutputObjectsDelegate {
-    var captureSession = AVCaptureSession()
-    var previewLayer: AVCaptureVideoPreviewLayer!
+    private let captureSession = AVCaptureSession()
+    private lazy var previewLayer: AVCaptureVideoPreviewLayer = {
+        .init(session: captureSession)
+    }()
+    private var isScannerFrameSetup = false
+    private var resetTimer: Timer?
+    private let resetDelay: TimeInterval = 1
+    private let scannerSize: CGFloat = 200
+    private var scannerFrameView: QRFrameView = .init()
+
     var onCodeScanned = EventDispatcher()
+
+    private var qrFrame: CGRect? {
+        didSet {
+            if qrFrame != oldValue {
+                setNeedsLayout()
+                layoutIfNeeded()
+            }
+        }
+    }
+
+    private var qrCorners: [CGPoint]? {
+        didSet {
+            if qrCorners != oldValue {
+                setNeedsLayout()
+                layoutIfNeeded()
+            }
+        }
+    }
+
+    private var centeredQrCorners: [CGPoint] {
+        [
+            CGPoint(x: centeredQrFrame.minX, y: centeredQrFrame.minY),
+            CGPoint(x: centeredQrFrame.minX, y: centeredQrFrame.maxY),
+            CGPoint(x: centeredQrFrame.maxX, y: centeredQrFrame.maxY),
+            CGPoint(x: centeredQrFrame.maxX, y: centeredQrFrame.minY)
+        ]
+    }
+
+    private var centeredQrFrame: CGRect {
+        CGRect(
+            origin: CGPoint(x: bounds.width/2 - scannerSize/2, y: bounds.height/2 - scannerSize/2),
+            size: CGSize(width: scannerSize, height: scannerSize)
+        )
+    }
 
     override init(frame: CGRect) {
         super.init(frame: frame)
-        initializeScanner()
+        setupScanner()
     }
 
     required init?(coder: NSCoder) {
         fatalError("init(coder:) has not been implemented")
     }
 
-    private func initializeScanner() {
-        guard let videoCaptureDevice = AVCaptureDevice.default(for: .video) else { return }
-        let videoInput: AVCaptureDeviceInput
+    override func layoutSubviews() {
+        super.layoutSubviews()
+        previewLayer.frame = bounds
+        scannerFrameView.frame = qrFrame ?? centeredQrFrame
+        scannerFrameView.shapeCorners = qrCorners ?? centeredQrCorners
+    }
 
-        do {
-            videoInput = try AVCaptureDeviceInput(device: videoCaptureDevice)
-        } catch {
-            return
-        }
+    private func setupScanner() {
+        translatesAutoresizingMaskIntoConstraints = false
+        initializeCaptureSession()
+        setupPreviewLayer()
+        startCaptureSession()
+        setupScannerFrame()
+    }
 
-        if captureSession.canAddInput(videoInput) {
-            captureSession.addInput(videoInput)
-        } else {
-            return
-        }
+    private func initializeCaptureSession() {
+        guard let videoCaptureDevice = AVCaptureDevice.default(for: .video),
+              let videoInput = try? AVCaptureDeviceInput(device: videoCaptureDevice),
+              captureSession.canAddInput(videoInput) else { return }
+
+        captureSession.addInput(videoInput)
 
         let metadataOutput = AVCaptureMetadataOutput()
+        guard captureSession.canAddOutput(metadataOutput) else { return }
 
-        if captureSession.canAddOutput(metadataOutput) {
-            captureSession.addOutput(metadataOutput)
-            metadataOutput.setMetadataObjectsDelegate(self, queue: DispatchQueue.main)
-            metadataOutput.metadataObjectTypes = [.qr]
-        } else {
-            return
-        }
+        captureSession.addOutput(metadataOutput)
+        metadataOutput.setMetadataObjectsDelegate(self, queue: DispatchQueue.main)
+        metadataOutput.metadataObjectTypes = [.qr]
+    }
 
+    private func setupPreviewLayer() {
         previewLayer = AVCaptureVideoPreviewLayer(session: captureSession)
-        previewLayer.frame = self.layer.bounds
+        previewLayer.frame = layer.bounds
         previewLayer.videoGravity = .resizeAspectFill
-        self.layer.addSublayer(previewLayer)
+        layer.addSublayer(previewLayer)
+    }
 
+    private func startCaptureSession() {
         DispatchQueue.global(qos: .background).async {
             self.captureSession.startRunning()
         }
     }
 
-    func metadataOutput(_ output: AVCaptureMetadataOutput, didOutput metadataObjects: [AVMetadataObject], from connection: AVCaptureConnection) {
-        captureSession.stopRunning()
+    private func setupScannerFrame() {
+        scannerFrameView.translatesAutoresizingMaskIntoConstraints = false
+        scannerFrameView.frame = centeredQrFrame
+        scannerFrameView.backgroundColor = .clear
+        addSubview(scannerFrameView)
+    }
 
-        if let metadataObject = metadataObjects.first,
-           let readableObject = metadataObject as? AVMetadataMachineReadableCodeObject,
-           let stringValue = readableObject.stringValue {
-            AudioServicesPlaySystemSound(SystemSoundID(kSystemSoundID_Vibrate))
+    func metadataOutput(_ output: AVCaptureMetadataOutput, didOutput metadataObjects: [AVMetadataObject], from connection: AVCaptureConnection) {
+        guard let metadataObject = metadataObjects.first as? AVMetadataMachineReadableCodeObject,
+              metadataObject.type == .qr,
+              let qrCodeObject = previewLayer.transformedMetadataObject(for: metadataObject) as? AVMetadataMachineReadableCodeObject else { return }
+        updateScannerFrame(withFrame: qrCodeObject.bounds, withCorners: qrCodeObject.corners)
+
+        if let stringValue = metadataObject.stringValue {
             onCodeScanned([
                 "data": stringValue
             ])
-            print("Swift: Qr code: \(stringValue)")
+            stopCaptureSession()
+        }
+    }
+    private func updateScannerFrame(withFrame qrCodeFrame: CGRect, withCorners corners: [CGPoint]) {
+        UIView.animate(withDuration: 0.25, delay: .zero, options: [.layoutSubviews, .beginFromCurrentState]) { [weak self] in
+            guard let self = self else { return }
+            self.qrFrame = qrCodeFrame
+            self.qrCorners = corners
         }
     }
 
-    override func layoutSubviews() {
-        super.layoutSubviews()
-        previewLayer.frame = self.layer.bounds
+
+    private func resetScannerFrameDimensions() {
+        UIView.animate(withDuration: 0.25, delay: .zero, options: [.layoutSubviews, .beginFromCurrentState]) { [weak self] in
+            self?.qrFrame = nil
+            self?.qrCorners = nil
+        }
     }
+
+    func stopCaptureSession() {
+        captureSession.stopRunning()
+        AudioServicesPlaySystemSound(SystemSoundID(kSystemSoundID_Vibrate))
+        resetTimer?.invalidate()
+    }
+
+
+
 
 }
